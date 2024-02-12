@@ -53,7 +53,7 @@ sample_count=$(echo $samples | wc -w)
 
 # create the header of the output file
 output_result=$output_prefix.results.tsv
-echo -e "source_sample\ttarget_sample\tmedian_vaf\tmean_vaf\tstatus\ttext_result" > $output_result
+echo -e "source_sample\ttarget_sample\tmedian_vaf\tmean_vaf\tinformative_variant_count\tstatus\ttext_result" > $output_result
 
 # create the temporary folder if it does not exist
 if [ ! -d tmp ]; then
@@ -63,27 +63,32 @@ fi
 # for each source sample
 for source_sample in $samples
 do
-    # we count the number of source samples processed
+    # we count the number of source samples processed for user feedback
     source_sample_count=$(($source_sample_count + 1))
-    source_sample_index=$(bcftools query -l $vcf_file | grep -n $source_sample | cut -d: -f1)
+    # we get the index of the source sample in the vcf
+    source_sample_index=$(bcftools query -l $vcf_file | grep -nx $source_sample | cut -d: -f1)
     source_sample_index=$(($source_sample_index - 1))
     # display status
+    echo "***"
+    echo "***"
+    echo "***"
     echo "source sample #$source_sample_count/$sample_count: $source_sample ($source_sample_index in vcf)"
     # for each target sample
     for target_sample in $samples
         do
-        target_sample_index=$(bcftools query -l $vcf_file | grep -n $target_sample | cut -d: -f1)
-        target_sample_index=$(($target_sample_index - 1))
+        target_sample_index=$(bcftools query -l $vcf_file | grep -nx $target_sample | cut -d: -f1)
+        target_sample_index=$(($target_sample_index - 1)) # can fail if two sample match the grep...
         # we skip the source sample
         if [ $source_sample == $target_sample ]; then
             continue
         fi
         # we get the variants that are 0/1 in the source sample and 0/0 in the target sample
         # we write the result in a temporary file as chrom  pos  ref  alt  and the genotype info of the target sample that are needed to compute the VAF : dp[0]  ad
-
         bcftools view -i "GT[$source_sample_index] == \"0/1\" && GT[$target_sample_index] == \"0/0\"" $vcf_file | bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t[%AD{1}\t%DP]\n" -s $target_sample > tmp/$source_sample.$target_sample.tmp
         # we remove the lines where the depth ($6) is 0 and we add the VAF to each line as field $7 (which is computed as $5/$6)
         awk -F"\t" '$6 != 0 {print $0"\t"$5/$6}' tmp/$source_sample.$target_sample.tmp > tmp/$source_sample.$target_sample.vaf
+        # we count the informative variants
+        informative_variant_count=$(wc -l tmp/$source_sample.$target_sample.vaf | awk '{print $1}')
         # we compute the median and mean VAF
         median_vaf=$(awk '{print $7}' tmp/$source_sample.$target_sample.vaf | sort -n | awk '{data[NR]=$1} END{print data[int(NR/2)+1]}')
         median_vaf=$(echo "$median_vaf" | tr ',' '.')
@@ -92,13 +97,13 @@ do
         # we check if the mean VAF is above the threshold using awk
         if [ $(awk -v mean_vaf="$mean_vaf" -v threshold="$threshold" 'BEGIN {print (mean_vaf > threshold)}') -eq 1 ]; then
             result_summary="CONTA"
-            text_result="WARNING : contamination detected : $target_sample is contaminated by $source_sample with a mean VAF of $mean_vaf (threshold: $threshold)"
+            text_result="WARNING | contamination detected: $target_sample is contaminated by $source_sample: heterozygous variants (GT=0/1) of $source_sample that are absent (GT=0/0) in $target_sample have a mean VAF of $mean_vaf in $target_sample (which is above the threshold: $threshold). Number of informative variants used: $informative_variant_count"
         else
             result_summary="OK"
-            text_result="OK : $target_sample is not contaminated by $source_sample with a mean VAF of $mean_vaf (threshold: $threshold)"
+            text_result="OK | $target_sample is not contaminated by $source_sample: heterozygous variants (GT=0/1) of $source_sample that are absent (GT=0/0) in $target_sample have a mean VAF of $mean_vaf in $target_sample (which is below the threshold: $threshold). Number of informative variants used: $informative_variant_count"
         fi
         # we append the result to the output file
-        line="$source_sample\t$target_sample\t$median_vaf\t$mean_vaf\t$result_summary\t$text_result"
+        line="$source_sample\t$target_sample\t$median_vaf\t$mean_vaf\t$informative_variant_count\t$result_summary\t$text_result"
         echo -e $line
         echo -e $line >> $output_result
     
@@ -143,6 +148,6 @@ echo "Matrix written in $output_matrix_file"
 echo "***************************"
 
 # remove the temporary folder
-rm -r tmp
+# rm -r tmp
 
 
