@@ -10,7 +10,7 @@ Usage:
 - script.sh -p <picard.jar file> -c <bam_contaminator> -d <bam_contaminated> -o <output_folder> -r <contamination_rate>
 
 
-# conta_check_v9.py — Cross-Contamination Detection
+# conta_check.py
 
 Detects cross-contamination between samples in a multi-sample VCF file.
 
