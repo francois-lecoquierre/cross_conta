@@ -2,8 +2,6 @@
 """
 Cross-Contamination Detection for Multi-Sample VCF Files
 
-Version 9 — samples are read directly from the multi-sample VCF header.
-
 This script detects cross-contamination between samples by analyzing variants that are:
 - Heterozygous (0/1) in the source sample (potential contaminator)
 - Homozygous reference (0/0) in the target sample (potentially contaminated)
@@ -12,22 +10,29 @@ The Variant Allele Frequency (VAF) is calculated from BAM files using bcftools m
 The estimated contamination is calculated as MEAN_VAF x 2 (accounting for heterozygosity).
 If the estimated contamination exceeds a specified threshold, contamination is suspected.
 
+Analysis pipeline (single genotyping pass):
+1. The VCF is read once to build a full genotype matrix for all samples.
+2. That matrix is scanned in-memory to determine, per sample pair, which
+   variants are informative, and per sample, which positions need VAF measurement.
+3. Each sample's BAM is genotyped exactly once (batched bcftools mpileup),
+   and the resulting VAFs are reused across every sample-pair comparison.
+
 Features:
-- Parallel processing for efficient analysis of multiple sample pairs
-- Interactive HTML heatmap with visual contamination indicators
+- Samples are read directly from the multi-sample VCF header
+- Parallel genotyping of samples (one batched mpileup call per sample)
+- Interactive, sectioned HTML report (header / contamination matrix / VAF distribution)
+  with a heatmap that automatically resizes for large sample counts
 - Configurable thresholds for contamination and minimum variant counts
-- Support for result caching and reload without re-analysis
-- Suitable for intra-family contamination detection (e.g., mother-fetus)
+- Support for result caching and reload without re-analysis (--reload-from)
 
 Requirements:
-- bcftools (for VCF operations and mpileup)
-- samtools (for BAM operations)
+- bcftools (VCF queries and mpileup-based genotyping)
 - Python 3.7+
-- plotly (optional, for heatmap generation)
+- plotly and numpy (optional, for the HTML report; analysis still runs without them)
 
-Author: [Your Name]
-Version: 8.0
-License: MIT
+Note: BAM files must already be indexed (.bai) before running this script.
+
+Version: 11.0
 """
 
 import argparse
@@ -36,8 +41,12 @@ import os
 import subprocess
 import random
 import tempfile
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+SCRIPT_VERSION = "11.0"
 
 # Optional dependencies
 try:
@@ -131,7 +140,7 @@ Examples:
     parser.add_argument(
         '--vaf-plot-only',
         action='store_true',
-        help='Generate only the VAF distribution plot without running cross-contamination analysis (for testing)'
+        help='Generate only the VAF distribution plot without running cross-contamination analysis'
     )
 
     return parser.parse_args()
@@ -215,114 +224,139 @@ def find_bam_for_sample(sample_name, bam_folder):
     return str(matching_bams[0])
 
 
-def get_informative_variants(vcf_file, source_sample, target_sample):
+def get_full_genotype_matrix(vcf_file, samples):
     """
-    Get informative variants for contamination detection.
-    
-    Informative variants are those that are:
-    - Heterozygous (0/1) in source sample
-    - Homozygous reference (0/0) in target sample
-    - Single nucleotide variants (SNVs) only
-    
+    Extract genotypes for every sample at every bi-allelic SNV in a single pass.
+
+    This is the "first pass" of the analysis: instead of re-scanning the VCF
+    once per (source, target) sample pair (as in previous versions), the
+    whole VCF is read exactly once here. The resulting genotype matrix is
+    then used in-memory to figure out, for every sample pair, which variants
+    are informative for contamination detection (see build_informative_variants).
+
     Args:
         vcf_file (str): Path to VCF file
-        source_sample (str): Source sample name (potential contaminator)
-        target_sample (str): Target sample name (potentially contaminated)
-        
+        samples (list): Sample names, in the same order as the VCF columns
+            (as returned by get_samples_from_vcf)
+
     Returns:
-        list: List of tuples (chrom, pos, ref, alt, source_gt)
+        list: List of tuples (chrom, pos, ref, alt, gts) where `gts` is the
+            list of genotype strings for all samples, aligned with `samples`
     """
-    # Get sample indices
+    filter_expr = 'TYPE="snp" && strlen(REF)=1 && strlen(ALT)=1'
+
     try:
-        samples_result = subprocess.run(
-            ['bcftools', 'query', '-l', vcf_file],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        samples = samples_result.stdout.strip().split('\n')
-        source_idx = samples.index(source_sample)
-        target_idx = samples.index(target_sample)
-    except (subprocess.CalledProcessError, ValueError) as e:
-        print(f"Error getting sample indices: {e}", file=sys.stderr)
-        return []
-    
-    # Build filter expression for bcftools
-    filter_expr = (
-        f'GT[{source_idx}]="0/1" && GT[{target_idx}]="0/0" && '
-        f'TYPE="snp" && strlen(REF)=1 && strlen(ALT)=1'
-    )
-    
-    try:
-        # Filter VCF
         result = subprocess.run(
-            ['bcftools', 'view', '-i', filter_expr, vcf_file],
+            ['bcftools', 'query', '-i', filter_expr,
+             '-f', '%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n', vcf_file],
             capture_output=True,
             text=True,
             check=True
         )
-        
-        if result.returncode != 0:
-            return []
-        
-        # Extract variant information including genotypes
-        query_result = subprocess.run(
-            ['bcftools', 'query', '-f', f'%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n'],
-            input=result.stdout,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        variants = []
-        for line in query_result.stdout.strip().split('\n'):
-            if line:
-                parts = line.split('\t')
-                if len(parts) >= 4 + len(samples):
-                    chrom, pos, ref, alt = parts[0:4]
-                    source_gt = parts[4 + source_idx]
-                    
-                    # Verify SNV
-                    if len(ref) == 1 and len(alt) == 1:
-                        variants.append((chrom, pos, ref, alt, source_gt))
-        
-        return variants
-        
     except subprocess.CalledProcessError as e:
-        print(f"Error querying VCF: {e}", file=sys.stderr)
+        print(f"Error querying VCF genotypes: {e}", file=sys.stderr)
         return []
 
+    n_samples = len(samples)
+    variants = []
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        parts = line.split('\t')
+        if len(parts) < 4 + n_samples:
+            continue
+        chrom, pos, ref, alt = parts[0:4]
+        if len(ref) != 1 or len(alt) != 1:
+            continue
+        gts = parts[4:4 + n_samples]
+        variants.append((chrom, pos, ref, alt, gts))
 
-def calculate_vaf_batch_mpileup(bam_file, reference, variants):
+    return variants
+
+
+# Genotype strings considered heterozygous / homozygous reference
+HET_GENOTYPES = {'0/1', '1/0', '0|1', '1|0'}
+HOMREF_GENOTYPES = {'0/0', '0|0'}
+
+
+def build_informative_variants(samples, genotype_matrix):
+    """
+    Single in-memory pass over the genotype matrix that determines:
+    1. For every ordered sample pair (source, target), the list of
+       informative variants (heterozygous in source, homozygous
+       reference in target).
+    2. For every target sample, the full set of positions that need to
+       be genotyped (VAF measured) in its BAM, deduplicated across every
+       source sample that is heterozygous there.
+
+    This lets the actual genotyping (bcftools mpileup) run exactly once per
+    sample (as a target) instead of once per sample pair, since the VAF
+    measured at a given position in a target's BAM never depends on which
+    source sample it is being compared against.
+
+    Args:
+        samples (list): Sample names
+        genotype_matrix (list): Output of get_full_genotype_matrix()
+
+    Returns:
+        tuple: (pair_variants, target_positions)
+            pair_variants (dict): (source, target) -> list of (chrom, pos, ref, alt)
+            target_positions (dict): target -> dict (chrom, pos) -> alt
+    """
+    pair_variants = defaultdict(list)
+    target_positions = defaultdict(dict)
+
+    for chrom, pos, ref, alt, gts in genotype_matrix:
+        het_samples = [s for s, gt in zip(samples, gts) if gt in HET_GENOTYPES]
+        if not het_samples:
+            continue
+        homref_samples = [s for s, gt in zip(samples, gts) if gt in HOMREF_GENOTYPES]
+        if not homref_samples:
+            continue
+
+        for target in homref_samples:
+            target_positions[target][(chrom, pos)] = alt
+
+        for source in het_samples:
+            for target in homref_samples:
+                if source == target:
+                    continue
+                pair_variants[(source, target)].append((chrom, pos, ref, alt))
+
+    return pair_variants, target_positions
+
+
+def calculate_vaf_batch_mpileup(bam_file, reference, positions):
     """
     Calculate VAF for multiple positions using bcftools mpileup in batch mode.
     
-    This is significantly faster than calling mpileup individually for each position.
+    This is run exactly once per sample (as a genotyping target); the
+    resulting VAFs are then reused for every sample-pair comparison that
+    involves this sample as target, instead of being recomputed once per
+    source sample.
     
     Args:
         bam_file (str): Path to BAM file
         reference (str): Path to reference genome
-        variants (list): List of tuples (chrom, pos, ref, alt, source_gt)
+        positions (list): List of tuples (chrom, pos, alt)
         
     Returns:
         dict: Dictionary mapping (chrom, pos) to VAF
     """
-    if not variants:
+    if not positions:
         return {}
     
     # Create temporary BED file with all positions
     # BED format is 0-based, VCF is 1-based
     with tempfile.NamedTemporaryFile(mode='w', suffix='.bed', delete=False) as bed_file:
         bed_path = bed_file.name
-        for chrom, pos, ref, alt, source_gt in variants:
+        for chrom, pos, alt in positions:
             bed_file.write(f"{chrom}\t{int(pos)-1}\t{pos}\n")
     
     vaf_dict = {}
     
     # Create lookup for expected alt alleles
-    variant_lookup = {}
-    for chrom, pos, ref, alt, source_gt in variants:
-        variant_lookup[(chrom, pos)] = alt
+    variant_lookup = {(chrom, pos): alt for chrom, pos, alt in positions}
     
     try:
         # Run bcftools mpileup with targets from BED file
@@ -366,7 +400,6 @@ def calculate_vaf_batch_mpileup(bam_file, reference, variants):
             
             chrom = fields[0]
             pos = fields[1]
-            ref_allele = fields[3]
             alt_alleles = fields[4].split(',')
             
             # Parse FORMAT and sample data
@@ -424,23 +457,79 @@ def calculate_vaf_batch_mpileup(bam_file, reference, variants):
     return vaf_dict
 
 
-def process_sample_pair(vcf_file, source_sample, target_sample, sample_to_bam, 
-                       reference, threshold, min_variants=100, max_variants=5000):
+def genotype_all_targets(target_positions, sample_to_bam, reference, threads=8):
     """
-    Process a single source-target sample pair for contamination detection.
-    
-    This function is designed to be run in parallel.
-    
+    Genotype (measure VAF) every position needed for each target sample
+    exactly once, using a single batched bcftools mpileup call per target BAM.
+
+    This is the "single genotyping pass" step: each sample's BAM is read
+    only once here, over the union of every position that any source sample
+    needs to compare against it, instead of being re-read once per source
+    sample as in previous versions.
+
     Args:
-        vcf_file (str): Path to VCF file
+        target_positions (dict): target -> dict (chrom, pos) -> alt
+        sample_to_bam (dict): sample name -> BAM file path
+        reference (str): Path to reference genome
+        threads (int): Number of parallel workers (one target genotyped per worker)
+
+    Returns:
+        dict: target -> dict (chrom, pos) -> VAF
+    """
+    tasks = []
+    for target, positions_dict in target_positions.items():
+        if target not in sample_to_bam:
+            continue
+        positions = [(chrom, pos, alt) for (chrom, pos), alt in positions_dict.items()]
+        tasks.append((target, positions))
+
+    total = len(tasks)
+    print(f"\nGenotyping {total} samples (one batched mpileup call per sample, "
+          f"reused across every comparison)...\n")
+
+    vaf_by_target = {}
+
+    if threads > 1 and total > 1:
+        with ProcessPoolExecutor(max_workers=threads) as executor:
+            future_to_target = {
+                executor.submit(calculate_vaf_batch_mpileup, sample_to_bam[target], reference, positions): target
+                for target, positions in tasks
+            }
+            completed = 0
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                completed += 1
+                try:
+                    vaf_by_target[target] = future.result()
+                    print(f"  [{completed}/{total}] {target}: {len(vaf_by_target[target])} positions genotyped")
+                except Exception as e:
+                    print(f"Error genotyping {target}: {e}", file=sys.stderr)
+                    vaf_by_target[target] = {}
+    else:
+        for idx, (target, positions) in enumerate(tasks, 1):
+            print(f"  [{idx}/{total}] Genotyping {target} ({len(positions)} positions)...")
+            vaf_by_target[target] = calculate_vaf_batch_mpileup(sample_to_bam[target], reference, positions)
+
+    return vaf_by_target
+
+
+def compute_pair_stats(source_sample, target_sample, variants, vaf_dict,
+                        threshold, min_variants=100, max_variants=5000):
+    """
+    Compute contamination statistics for a single source-target sample pair,
+    reusing genotypes (VAFs) that were already measured once for the target
+    sample by genotype_all_targets(). No BAM/VCF access happens here.
+
+    Args:
         source_sample (str): Source sample name
         target_sample (str): Target sample name
-        sample_to_bam (dict): Mapping of sample names to BAM file paths
-        reference (str): Path to reference genome
+        variants (list): Informative variants for this pair: (chrom, pos, ref, alt),
+            all heterozygous in source_sample and homozygous reference in target_sample
+        vaf_dict (dict): Precomputed (chrom, pos) -> VAF for target_sample's BAM
         threshold (float): Contamination threshold
         min_variants (int): Minimum number of informative variants required
         max_variants (int): Maximum number of variants to use (downsampling)
-        
+
     Returns:
         dict: Analysis results with keys:
             - source_sample, target_sample
@@ -463,61 +552,43 @@ def process_sample_pair(vcf_file, source_sample, target_sample, sample_to_bam,
         'insufficient_variants': False,
         'text_result': ''
     }
-    
-    # Get informative variants (1/1 in source, 0/0 in target)
-    variants = get_informative_variants(vcf_file, source_sample, target_sample)
-    
+
     original_count = len(variants)
-    
+
     # Check if we have enough variants - return immediately without processing
-    if len(variants) < min_variants:
+    if original_count < min_variants:
         result['insufficient_variants'] = True
         result['informative_variant_count'] = original_count
         result['gt_0_1_count'] = original_count
         result['text_result'] = f'Insufficient informative variants: {original_count} (< {min_variants} required)'
         result['status'] = 'INSUFFICIENT_DATA'
         return result
-    
-    # Downsample if needed
-    if len(variants) > max_variants:
+
+    # Downsample if needed (all variants here are heterozygous in source by construction)
+    if original_count > max_variants:
         variants = random.sample(variants, max_variants)
-    
-    # Count genotypes in the (possibly downsampled) set
-    gt_0_1_count = sum(1 for v in variants if v[4] in ['0/1', '1/0', '0|1', '1|0'])
-    
-    # Calculate VAF for all variants using batch mpileup
-    target_bam = sample_to_bam[target_sample]
-    vaf_dict = calculate_vaf_batch_mpileup(target_bam, reference, variants)
-    
-    # Extract VAF values
-    vafs = []
-    vafs_0_1 = []
-    
-    for chrom, pos, ref, alt, source_gt in variants:
-        vaf = vaf_dict.get((chrom, pos))
-        if vaf is not None:
-            vafs.append(vaf)
-            if source_gt in ['0/1', '1/0', '0|1', '1|0']:
-                vafs_0_1.append(vaf)
-    
+
+    # Look up precomputed VAFs (already measured once for target_sample)
+    vafs = [vaf_dict[(chrom, pos)] for chrom, pos, ref, alt in variants if (chrom, pos) in vaf_dict]
+
     if len(vafs) == 0:
         result['informative_variant_count'] = len(variants)
-        result['gt_0_1_count'] = gt_0_1_count
+        result['gt_0_1_count'] = len(variants)
         result['text_result'] = 'Failed to calculate VAF for variants'
         result['insufficient_variants'] = False
         return result
-    
+
     # Calculate statistics
     vafs.sort()
     median_vaf = vafs[len(vafs) // 2]
     mean_vaf = sum(vafs) / len(vafs)
     estimated_conta = mean_vaf * 2  # Factor of 2 for heterozygous variants
-    
+
     # Build downsample note
     downsample_note = ""
     if original_count > max_variants:
         downsample_note = f" (downsampled from {original_count})"
-    
+
     # Determine contamination status
     if estimated_conta > threshold:
         status = 'CONTA'
@@ -540,17 +611,17 @@ def process_sample_pair(vcf_file, source_sample, target_sample, sample_to_bam,
             f"(below threshold: {threshold}). "
             f"Informative variants: {len(vafs)}{downsample_note}"
         )
-    
+
     result.update({
         'median_vaf': f"{median_vaf:.4f}",
         'mean_vaf': f"{mean_vaf:.4f}",
         'estimated_conta': f"{estimated_conta:.4f}",
         'informative_variant_count': len(vafs),
-        'gt_0_1_count': len(vafs_0_1),
+        'gt_0_1_count': len(vafs),
         'status': status,
         'text_result': text_result
     })
-    
+
     return result
 
 
@@ -558,13 +629,24 @@ def analyze_contamination(vcf_file, bam_folder, reference, threshold, min_varian
     """
     Analyze cross-contamination between all sample pairs.
 
+    The analysis runs in three passes to avoid recomputing the same VAF
+    measurements multiple times:
+      1. Read the whole VCF once to build a full genotype matrix, then scan
+         it in-memory to determine, for every sample pair, which variants
+         are informative, and for every sample (as target), which positions
+         need to be genotyped.
+      2. Genotype (bcftools mpileup) each sample exactly once, over the
+         union of positions needed by every source sample compared against it.
+      3. Compute contamination statistics for every sample pair by reusing
+         the genotypes from step 2 (pure in-memory lookup, no further BAM/VCF access).
+
     Args:
         vcf_file (str): Path to VCF file
         bam_folder (str): Path to BAM folder
         reference (str): Path to reference genome
         threshold (float): Contamination threshold
         min_variants (int): Minimum number of informative variants required
-        threads (int): Number of parallel threads to use
+        threads (int): Number of parallel threads to use for genotyping
 
     Returns:
         tuple: (results list, samples list)
@@ -592,7 +674,22 @@ def analyze_contamination(vcf_file, bam_folder, reference, threshold, min_varian
     if len(sample_to_bam) < 2:
         print("\nError: Need at least 2 samples with valid BAM files", file=sys.stderr)
         sys.exit(1)
-    
+
+    # --- Pass 1: figure out, globally, which variants need to be genotyped and for whom ---
+    print("\nScanning VCF once to build the full genotype matrix...")
+    genotype_matrix = get_full_genotype_matrix(vcf_file, samples)
+    print(f"  {len(genotype_matrix)} bi-allelic SNVs loaded")
+
+    print("Determining informative variants for every sample pair...")
+    pair_variants, target_positions = build_informative_variants(samples, genotype_matrix)
+    total_positions = sum(len(p) for p in target_positions.values())
+    print(f"  {len(pair_variants)} sample pairs have candidate informative variants")
+    print(f"  {total_positions} (sample, position) genotyping tasks needed in total, "
+          f"deduplicated across all comparisons")
+
+    # --- Pass 2: genotype (measure VAF) each sample exactly once ---
+    vaf_by_target = genotype_all_targets(target_positions, sample_to_bam, reference, threads)
+
     # Build list of all sample pairs to process
     sample_pairs = []
     for source_sample in samples:
@@ -606,65 +703,29 @@ def analyze_contamination(vcf_file, bam_folder, reference, threshold, min_varian
             sample_pairs.append((source_sample, target_sample))
     
     total_pairs = len(sample_pairs)
-    print(f"\nProcessing {total_pairs} sample pairs using {threads} threads...\n")
-    
+    print(f"\nComputing contamination statistics for {total_pairs} sample pairs "
+          f"(reusing precomputed genotypes, no further BAM access needed)...\n")
+
+    # --- Pass 3: compute per-pair statistics from the precomputed genotypes ---
     results = []
-    
-    # Process pairs in parallel
-    if threads > 1:
-        with ProcessPoolExecutor(max_workers=threads) as executor:
-            # Submit all jobs
-            future_to_pair = {}
-            for source_sample, target_sample in sample_pairs:
-                future = executor.submit(
-                    process_sample_pair,
-                    vcf_file,
-                    source_sample,
-                    target_sample,
-                    sample_to_bam,
-                    reference,
-                    threshold,
-                    min_variants
-                )
-                future_to_pair[future] = (source_sample, target_sample)
-            
-            # Collect results as they complete
-            completed = 0
-            for future in as_completed(future_to_pair):
-                source_sample, target_sample = future_to_pair[future]
-                completed += 1
-                try:
-                    result = future.result()
-                    results.append(result)
-                    status = result['status']
-                    mean_vaf = result['mean_vaf']
-                    estimated_conta = result['estimated_conta']
-                    informative_count = result['gt_0_1_count']
-                    print(f"[{completed}/{total_pairs}] {source_sample} -> {target_sample}: "
-                          f"Status={status}, Mean_VAF={mean_vaf}, Estimated_conta={estimated_conta}, Informative_variants={informative_count}")
-                except Exception as e:
-                    print(f"Error processing {source_sample} -> {target_sample}: {e}", 
-                          file=sys.stderr)
-    else:
-        # Single-threaded mode
-        for idx, (source_sample, target_sample) in enumerate(sample_pairs, 1):
-            print(f"\n[{idx}/{total_pairs}] Processing {source_sample} -> {target_sample}")
-            try:
-                result = process_sample_pair(
-                    vcf_file,
-                    source_sample,
-                    target_sample,
-                    sample_to_bam,
-                    reference,
-                    threshold,
-                    min_variants
-                )
-                results.append(result)
-                informative_count = result['gt_0_1_count']
-                print(f"  Status: {result['status']}, Mean_VAF: {result['mean_vaf']}, Estimated_conta: {result['estimated_conta']}, Informative_variants: {informative_count}")
-            except Exception as e:
-                print(f"  Error: {e}", file=sys.stderr)
-    
+    for idx, (source_sample, target_sample) in enumerate(sample_pairs, 1):
+        variants = pair_variants.get((source_sample, target_sample), [])
+        vaf_dict = vaf_by_target.get(target_sample, {})
+        try:
+            result = compute_pair_stats(
+                source_sample, target_sample, variants, vaf_dict,
+                threshold, min_variants
+            )
+            results.append(result)
+            status = result['status']
+            mean_vaf = result['mean_vaf']
+            estimated_conta = result['estimated_conta']
+            informative_count = result['gt_0_1_count']
+            print(f"[{idx}/{total_pairs}] {source_sample} -> {target_sample}: "
+                  f"Status={status}, Mean_VAF={mean_vaf}, Estimated_conta={estimated_conta}, Informative_variants={informative_count}")
+        except Exception as e:
+            print(f"Error processing {source_sample} -> {target_sample}: {e}", file=sys.stderr)
+
     return results, samples
 
 
@@ -874,11 +935,13 @@ def generate_vaf_plot(vcf_file, samples):
     return fig
 
 
-def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_variants=100, vcf_file=None):
+def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_variants=100, vcf_file=None,
+                      bam_folder=None, reference=None, threads=None, reload_source=None):
     """
-    Generate an interactive heatmap of estimated contamination values using plotly.
+    Generate the interactive contamination report (matrix heatmap + VAF
+    distribution) as a single HTML page, using plotly.
     
-    The heatmap includes:
+    The report includes:
     - Color coding based on estimated contamination (green=OK, yellow=intermediate, red=contamination)
     - Emoji indicators (⚠️ for contamination)
     - "N=X" annotations for insufficient data
@@ -892,9 +955,14 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
         threshold (float): Contamination threshold
         min_variants (int): Minimum number of informative variants required
         vcf_file (str, optional): Path to VCF file for VAF plot generation
+        bam_folder (str, optional): BAM folder, shown in the report header
+        reference (str, optional): Reference genome, shown in the report header
+        threads (int, optional): Number of threads used, shown in the report header
+        reload_source (str, optional): Results TSV the report was reloaded from,
+            shown in the report header instead of the analysis parameters
         
     Returns:
-        str or None: Path to heatmap file, or None if plotly unavailable
+        str or None: Path to the report file, or None if plotly unavailable
     """
     if not PLOTLY_AVAILABLE:
         print("Plotly not available, skipping heatmap generation")
@@ -929,6 +997,29 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
     
     # Build matrices for heatmap
     n_samples = len(samples)
+
+    # --- Responsive sizing: shrink cell size and font sizes as the sample
+    # count grows, so the matrix never overflows its column width. The matrix
+    # column occupies ~2/3 of the page (see PAGE_MAX_WIDTH / matrix_section
+    # layout below), the legend takes the remaining third on the right.
+    PAGE_MAX_WIDTH = 1500
+    MAX_HEATMAP_WIDTH = 900
+    MAX_HEATMAP_HEIGHT = 1000
+    MIN_CELL_SIZE = 16
+    MAX_CELL_SIZE = 45
+
+    cell_size = MAX_HEATMAP_WIDTH / max(n_samples, 1)
+    cell_size = max(MIN_CELL_SIZE, min(MAX_CELL_SIZE, cell_size))
+
+    heatmap_width = min(MAX_HEATMAP_WIDTH, max(500, int(n_samples * cell_size)))
+    heatmap_height = min(MAX_HEATMAP_HEIGHT, max(450, int(n_samples * cell_size)))
+
+    cell_text_font_size = max(7, min(20, int(cell_size * 0.5)))
+    tick_font_size = max(7, min(13, int(cell_size * 0.32)))
+    axis_title_font_size = max(10, min(14, int(cell_size * 0.35)))
+    annotation_font_size = max(6, min(9, int(cell_size * 0.22)))
+    margin_side = max(80, min(150, int(cell_size * 3)))
+
     z_matrix = []       # Estimated contamination values
     hover_text = []     # Hover tooltips
     text_matrix = []    # Emoji indicators
@@ -994,7 +1085,7 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
                             x=j, y=i,
                             text=f"N={informative_variants}",
                             showarrow=False,
-                            font=dict(size=9, color='orange'),
+                            font=dict(size=annotation_font_size, color='orange'),
                             xref='x', yref='y'
                         )
                     )
@@ -1035,7 +1126,7 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
         y=samples,
         text=text_matrix,
         texttemplate='%{text}',
-        textfont=dict(size=20),
+        textfont=dict(size=cell_text_font_size),
         customdata=hover_text,
         hovertemplate='%{customdata}<extra></extra>',
         colorscale='RdYlGn_r',  # Reversed Red-Yellow-Green
@@ -1055,38 +1146,41 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
         )
     ))
     
-    # Update layout
+    # Update layout - width/height/fonts are capped and scaled down for large
+    # sample counts so the matrix stays within a reasonable page width
     fig.update_layout(
         title=dict(
-            text=f'Cross-Contamination Analysis - Estimated Contamination Heatmap<br><sub>Threshold: {threshold:.1%} | Min variants: {min_variants}</sub>',
+            text='Estimated Contamination Matrix',
             x=0.5,
             xanchor='center'
         ),
         xaxis=dict(
-            title='Target Sample',
+            title=dict(text='Target Sample', font=dict(size=axis_title_font_size)),
             tickangle=-45,
+            tickfont=dict(size=tick_font_size),
             side='bottom'
         ),
         yaxis=dict(
-            title='Source Sample',
+            title=dict(text='Source Sample', font=dict(size=axis_title_font_size)),
+            tickfont=dict(size=tick_font_size),
             autorange='reversed'
         ),
         annotations=annotations,
-        width=max(800, n_samples * 40),
-        height=max(700, n_samples * 40),
-        margin=dict(l=150, r=150, t=100, b=150)
+        width=heatmap_width,
+        height=heatmap_height,
+        margin=dict(l=margin_side, r=60, t=80, b=margin_side)
     )
     
-    # Save to HTML with method description
     heatmap_file = f"{output_prefix}.heatmap.html"
     
-    # Create method description panel
+    # Legend panel for the matrix section (sized to fill its column, see
+    # matrix_section layout below)
     method_description = f"""
-    <div style="max-width: 400px; min-width: 300px; padding: 20px; background-color: #f8f9fa; border-radius: 5px; font-family: Arial, sans-serif; margin-left: 20px; margin-top: 80px;">
-        <h2 style="color: #2c3e50; margin-top: 0; font-size: 1.3em;">📊 Method</h2>
+    <div style="width: 100%; box-sizing: border-box; padding: 20px; background-color: #f8f9fa; border-radius: 8px; font-family: Arial, sans-serif;">
+        <h3 style="color: #2c3e50; margin-top: 0; font-size: 1.2em;">📖 Legend</h3>
         
-        <h3 style="color: #34495e; font-size: 1.1em;">Principle</h3>
-        <p style="line-height: 1.6; font-size: 0.9em;">
+        <h4 style="color: #34495e; font-size: 1.05em; margin-bottom: 4px;">Principle</h4>
+        <p style="line-height: 1.6; font-size: 0.9em; margin-top: 4px;">
         Contamination detection via variants:
         </p>
         <ul style="line-height: 1.6; font-size: 0.9em;">
@@ -1094,13 +1188,13 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
             <li><strong>0/0</strong> (homozygous ref) in target (X-axis)</li>
         </ul>
         
-        <h3 style="color: #34495e; font-size: 1.1em;">Metrics</h3>
+        <h4 style="color: #34495e; font-size: 1.05em; margin-bottom: 4px;">Metrics</h4>
         <ul style="line-height: 1.6; font-size: 0.9em;">
             <li><strong>VAF</strong>: Variant Allele Frequency in target</li>
             <li><strong>Estimated conta</strong>: VAF × 2 (accounts for heterozygosity)</li>
         </ul>
         
-        <h3 style="color: #34495e; font-size: 1.1em;">Interpretation</h3>
+        <h4 style="color: #34495e; font-size: 1.05em; margin-bottom: 4px;">Interpretation</h4>
         <ul style="line-height: 1.6; font-size: 0.9em;">
             <li><strong>Threshold</strong>: {threshold * 100:.1f}%</li>
             <li><strong>Min variants</strong>: {min_variants}</li>
@@ -1120,8 +1214,8 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
         try:
             vaf_fig = generate_vaf_plot(vcf_file, samples)
             if vaf_fig:
-                vaf_plot_html = f'<div style="margin-left: 20px; margin-top: 80px;">{vaf_fig.to_html(include_plotlyjs=False, full_html=False)}</div>'
-                print("VAF plot successfully generated and integrated into heatmap")
+                vaf_plot_html = vaf_fig.to_html(include_plotlyjs=False, full_html=False)
+                print("VAF plot successfully generated and integrated into the report")
             else:
                 print("Warning: VAF plot generation returned None", file=sys.stderr)
         except Exception as e:
@@ -1131,46 +1225,126 @@ def generate_heatmap(results, samples, output_prefix, threshold=0.02, min_varian
     else:
         print("\nSkipping VAF plot generation (no VCF file provided)")
     
-    # Get plotly HTML
+    # Get plotly HTML for the matrix figure, and split it into <head> / plot-div
+    # so it can be embedded inside our own vertically-sectioned page layout
     html_content = fig.to_html(include_plotlyjs='cdn')
-    
-    # Wrap plot, description, and VAF plot in flex container
     html_parts = html_content.split('<body>')
     if len(html_parts) == 2:
-        flex_wrapper_start = '<div style="display: flex; align-items: flex-start; justify-content: flex-start; padding: 20px;">'
-        flex_wrapper_end = '</div>'
-        
+        head_html = html_parts[0]
         body_parts = html_parts[1].split('</body>')
-        if len(body_parts) == 2:
-            final_html = (html_parts[0] + '<body>' + 
-                         flex_wrapper_start + 
-                         body_parts[0] + 
-                         method_description + 
-                         vaf_plot_html + 
-                         flex_wrapper_end + 
-                         '</body>' + body_parts[1])
-        else:
-            final_html = html_content
+        plot_div_html = body_parts[0] if len(body_parts) == 2 else html_content
+        tail_html = body_parts[1] if len(body_parts) == 2 else '</html>'
     else:
-        final_html = html_content
+        head_html = '<head><meta charset="utf-8"></head>'
+        plot_div_html = html_content
+        tail_html = '</html>'
+
+    # Set a proper browser-tab title for the report (plotly's default head has none)
+    title_tag = f"<title>Contamination Report - {n_samples} samples</title>"
+    if '<title>' in head_html and '</title>' in head_html:
+        title_start = head_html.find('<title>')
+        title_end = head_html.find('</title>', title_start) + len('</title>')
+        head_html = head_html[:title_start] + title_tag + head_html[title_end:]
+    else:
+        head_html = head_html.replace('<head>', f'<head>\n    {title_tag}', 1)
+
+    n_conta = sum(1 for v in status_dict.values() if v == 'CONTA')
+    n_insufficient = sum(1 for v in insufficient_dict.values() if v)
+    generated_on = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    # Build the list of analysis-parameter badges shown in the header. Each
+    # one is only shown when the corresponding value is available (e.g. BAM
+    # folder/reference/threads are unknown in --reload-from mode).
+    param_badges = []
+    if reload_source:
+        param_badges.append(f"📂 Reloaded from: {os.path.basename(reload_source)}")
+    if vcf_file:
+        param_badges.append(f"📄 VCF: {os.path.basename(vcf_file)}")
+    if bam_folder:
+        param_badges.append(f"🗂️ BAM folder: {os.path.basename(os.path.normpath(bam_folder))}")
+    if reference:
+        param_badges.append(f"🧬 Reference: {os.path.basename(reference)}")
+    if threads:
+        param_badges.append(f"⚙️ Threads: {threads}")
+
+    params_html = ""
+    if param_badges:
+        params_html = (
+            '<p style="margin: 8px 0 0 0; opacity: 0.85; font-size: 0.85em;">' +
+            ' &nbsp;|&nbsp; '.join(param_badges) +
+            '</p>'
+        )
+
+    # --- Section 1: Header ---
+    header_section = f"""
+    <div style="background: linear-gradient(135deg, #2c3e50, #34495e); color: white; padding: 25px 30px; border-radius: 8px; font-family: Arial, sans-serif; margin-bottom: 25px;">
+        <h1 style="margin: 0 0 8px 0; font-size: 1.6em;">🧬 Cross-Contamination Analysis Report</h1>
+        <p style="margin: 0; opacity: 0.9; font-size: 0.95em;">
+            {n_samples} samples analyzed &nbsp;|&nbsp;
+            Threshold: {threshold:.1%} &nbsp;|&nbsp;
+            Min variants: {min_variants} &nbsp;|&nbsp;
+            ⚠️ {n_conta} contamination(s) detected &nbsp;|&nbsp;
+            {n_insufficient} insufficient-data pair(s)
+        </p>
+        {params_html}
+        <p style="margin: 6px 0 0 0; opacity: 0.7; font-size: 0.8em;">Generated on {generated_on}</p>
+    </div>
+    """
+
+    # --- Section 2: Matrix + legend ---
+    # Two-column layout: the matrix takes ~2/3 of the width (flex: 2), the
+    # legend takes the remaining third on the right (flex: 1). flex-wrap lets
+    # the legend drop below the matrix on narrow screens instead of overflowing.
+    matrix_section = f"""
+    <div style="margin-bottom: 30px;">
+        <h2 style="font-family: Arial, sans-serif; color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 8px; margin-top: 0;">📊 Cross-Contamination Matrix</h2>
+        <div style="display: flex; flex-wrap: wrap; align-items: flex-start; gap: 20px; margin-top: 15px;">
+            <div style="flex: 2 1 550px; min-width: 0; overflow-x: auto; max-width: 100%;">{plot_div_html}</div>
+            <div style="flex: 1 1 280px; min-width: 260px; max-width: 420px;">{method_description}</div>
+        </div>
+    </div>
+    """
+
+    # --- Section 3: VAF distribution ---
+    vaf_section = ""
+    if vaf_plot_html:
+        vaf_section = f"""
+        <div style="margin-bottom: 10px;">
+            <h2 style="font-family: Arial, sans-serif; color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 8px;">📈 VAF Distribution of Heterozygous SNVs</h2>
+            <div style="overflow-x: auto; max-width: 100%; margin-top: 15px;">{vaf_plot_html}</div>
+        </div>
+        """
+
+    page_style = f'<div style="max-width: {PAGE_MAX_WIDTH}px; margin: 0 auto; padding: 20px;">'
+
+    final_html = (
+        head_html + '<body>' +
+        page_style +
+        header_section +
+        matrix_section +
+        vaf_section +
+        '</div>' +
+        tail_html
+    )
     
     # Write to file
     with open(heatmap_file, 'w', encoding='utf-8') as f:
         f.write(final_html)
     
-    print(f"Heatmap saved to {heatmap_file}")
+    print(f"Contamination report saved to {heatmap_file}")
     
     return heatmap_file
 
 
-def write_results(results, samples, output_prefix, threshold=0.02, min_variants=100, vcf_file=None):
+def write_results(results, samples, output_prefix, threshold=0.02, min_variants=100, vcf_file=None,
+                   bam_folder=None, reference=None, threads=None, reload_source=None):
     """
-    Write results to TSV files and generate visualizations.
+    Write results to TSV files and generate the interactive contamination report.
     
     Generates three output files:
     1. {output_prefix}.results.tsv - Detailed results for all sample pairs
     2. {output_prefix}.matrix.estimated_conta.tsv - Matrix format of estimated contamination values
-    3. {output_prefix}.heatmap.html - Interactive heatmap (if plotly available)
+    3. {output_prefix}.heatmap.html - Interactive contamination report (if plotly available)
     
     Args:
         results (list): List of result dictionaries
@@ -1179,6 +1353,11 @@ def write_results(results, samples, output_prefix, threshold=0.02, min_variants=
         threshold (float): Contamination threshold used
         min_variants (int): Minimum variants threshold used
         vcf_file (str, optional): Path to VCF file for VAF plot generation
+        bam_folder (str, optional): BAM folder, shown in the report header
+        reference (str, optional): Reference genome, shown in the report header
+        threads (int, optional): Number of threads used, shown in the report header
+        reload_source (str, optional): Results TSV the report was reloaded from,
+            shown in the report header instead of the analysis parameters
     """
     # Write detailed results
     results_file = f"{output_prefix}.results.tsv"
@@ -1252,13 +1431,14 @@ def write_results(results, samples, output_prefix, threshold=0.02, min_variants=
     print(f"Results written to {results_file}")
     print(f"Matrix written to {matrix_file}")
     
-    # Generate heatmap
+    # Generate the contamination report
     try:
-        heatmap_file = generate_heatmap(results, samples, output_prefix, threshold, min_variants, vcf_file)
+        heatmap_file = generate_heatmap(results, samples, output_prefix, threshold, min_variants, vcf_file,
+                                         bam_folder, reference, threads, reload_source)
         if heatmap_file:
-            print(f"Interactive heatmap saved to {heatmap_file}")
+            print(f"Interactive contamination report saved to {heatmap_file}")
     except Exception as e:
-        print(f"Warning: Failed to generate heatmap: {e}", file=sys.stderr)
+        print(f"Warning: Failed to generate contamination report: {e}", file=sys.stderr)
     
     print("=" * 60)
 
@@ -1336,10 +1516,16 @@ def load_results_from_file(results_file):
 def main():
     """Main entry point for the script."""
     args = parse_arguments()
+
+    # Ensure the output directory exists (output_prefix may point into a
+    # subdirectory, e.g. "output/batch_156_C/batch_156_C_conta")
+    output_dir = os.path.dirname(args.output_prefix)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # Display analysis parameters
     print("=" * 60)
-    print("Cross-Contamination Analysis - Version 9.0")
+    print(f"Cross-Contamination Analysis - Version {SCRIPT_VERSION}")
     print("=" * 60)
     print(f"VCF file:       {args.vcf}")
     print(f"BAM folder:     {args.bam_folder}")
@@ -1399,7 +1585,8 @@ def main():
             print(f"Loaded {len(results)} results for {len(samples)} samples")
             
             # Regenerate outputs (without VCF for reload mode)
-            write_results(results, samples, args.output_prefix, args.threshold, args.min_variants, None)
+            write_results(results, samples, args.output_prefix, args.threshold, args.min_variants,
+                           reload_source=args.reload_from)
             
             print("\n✅ Plot regeneration complete!")
             return
@@ -1431,12 +1618,11 @@ def main():
     )
     
     # Write results with VCF file for VAF plot generation
-    write_results(results, samples, args.output_prefix, args.threshold, args.min_variants, args.vcf)
+    write_results(results, samples, args.output_prefix, args.threshold, args.min_variants, args.vcf,
+                  args.bam_folder, args.reference, args.threads)
     
     print("\n✅ Analysis complete!")
 
 
 if __name__ == '__main__':
     main()
-
-
